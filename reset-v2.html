@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reset Password — Stream Smart</title>
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <style>
+    body { margin:0; font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+           background:#0E0E12; color:#F5F4F0; display:flex; align-items:center;
+           justify-content:center; min-height:100vh; text-align:center; }
+    .card { max-width:400px; width:100%; padding:48px 32px; box-sizing:border-box; }
+    h1 { font-size:24px; margin:0 0 8px; letter-spacing:-0.5px; }
+    p { font-size:15px; color:#A9A8A0; line-height:1.6; margin:0 0 24px; }
+    input { width:100%; box-sizing:border-box; padding:14px 16px; margin-bottom:12px;
+            border-radius:10px; border:1px solid #2A2A32; background:#1A1A20; color:#F5F4F0;
+            font-size:16px; outline:none; }
+    input:focus { border-color:#534AB7; }
+    button { width:100%; padding:14px; border-radius:10px; border:none; background:#534AB7;
+             color:#fff; font-size:16px; font-weight:600; cursor:pointer; margin-top:4px; }
+    button:disabled { opacity:0.5; }
+    .msg { font-size:14px; margin-top:14px; min-height:20px; }
+    .err { color:#E5745A; }
+    .ok { color:#3DBD8E; }
+    .hidden { display:none; }
+    .check { width:64px; height:64px; border-radius:50%; background:#1D9E75;
+             display:flex; align-items:center; justify-content:center;
+             margin:0 auto 20px; font-size:30px; }
+    .brand { margin-top:36px; font-size:13px; color:#6B6A64; }
+    .mfa-hint { font-size:13px; color:#A9A8A0; margin:0 0 8px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div id="form-state">
+      <h1>Reset your password</h1>
+      <p>Choose a new password for your Stream Smart account.</p>
+      <input type="password" id="pw1" placeholder="New password (min 8 characters)" autocomplete="new-password">
+      <input type="password" id="pw2" placeholder="Confirm new password" autocomplete="new-password">
+      <div id="mfa-row" class="hidden">
+        <p class="mfa-hint">This account has two-factor authentication. Enter the 6-digit code from your authenticator app.</p>
+        <input type="text" id="mfa-code" placeholder="6-digit authenticator code" inputmode="numeric" maxlength="6" autocomplete="one-time-code">
+      </div>
+      <button id="save">Save new password</button>
+      <div class="msg" id="msg"></div>
+    </div>
+    <div id="done-state" class="hidden">
+      <div class="check">✓</div>
+      <h1>Password updated</h1>
+      <p>Open the Stream Smart app and sign in with your new password.</p>
+    </div>
+    <div id="invalid-state" class="hidden">
+      <h1>Link expired or invalid</h1>
+      <p>This reset link is no longer valid. Open the Stream Smart app and tap "Forgot password?" to get a new one.</p>
+    </div>
+    <div class="brand">Stream Smart · usestreamsmart.com</div>
+  </div>
+
+  <script>
+    const supa = supabase.createClient(
+      'https://glfqahjrtcdtdclceixb.supabase.co',
+      'sb_publishable_ybJdTgj9AgI_lOBVgjIQew_YR6B7rbh'
+    );
+
+    const formState = document.getElementById('form-state');
+    const doneState = document.getElementById('done-state');
+    const invalidState = document.getElementById('invalid-state');
+    const msg = document.getElementById('msg');
+    const saveBtn = document.getElementById('save');
+    let recoveryReady = false;
+    let mfaVerified = false;
+
+    // The recovery token in the URL is consumed automatically by the client
+    // (detectSessionInUrl is on by default) and emits PASSWORD_RECOVERY / SIGNED_IN.
+    supa.auth.onAuthStateChange((event, session) => {
+      if (event === 'PASSWORD_RECOVERY' || (event === 'SIGNED_IN' && session)) {
+        recoveryReady = true;
+      }
+    });
+
+    // If after a beat there's no session at all, the link was bad/expired.
+    setTimeout(async () => {
+      const { data } = await supa.auth.getSession();
+      if (!data.session && !recoveryReady) {
+        formState.classList.add('hidden');
+        invalidState.classList.remove('hidden');
+      }
+    }, 2500);
+
+    async function ensureAAL2() {
+      // Accounts with MFA enrolled need the second factor before a password
+      // change (Supabase enforces AAL2 for updateUser on MFA accounts).
+      if (mfaVerified) return { ok: true };
+      const { data: aal } = await supa.auth.mfa.getAuthenticatorAssuranceLevel();
+      // No MFA on the account, or already at the required level → proceed.
+      if (!aal || aal.currentLevel === aal.nextLevel || aal.nextLevel !== 'aal2') {
+        return { ok: true };
+      }
+      const code = document.getElementById('mfa-code')?.value?.trim();
+      if (!code || code.length !== 6) {
+        document.getElementById('mfa-row').classList.remove('hidden');
+        return { ok: false, msg: 'Enter the 6-digit code from your authenticator app, then tap Save again.' };
+      }
+      const { data: factors, error: fErr } = await supa.auth.mfa.listFactors();
+      if (fErr) return { ok: false, msg: fErr.message };
+      const totp = factors?.totp?.[0];
+      if (!totp) return { ok: false, msg: 'No authenticator factor found on this account.' };
+      const { data: challenge, error: chErr } = await supa.auth.mfa.challenge({ factorId: totp.id });
+      if (chErr) return { ok: false, msg: chErr.message };
+      const { error: vErr } = await supa.auth.mfa.verify({
+        factorId: totp.id, challengeId: challenge.id, code,
+      });
+      if (vErr) return { ok: false, msg: 'Invalid code — try again.' };
+      mfaVerified = true;
+      return { ok: true };
+    }
+
+    saveBtn.addEventListener('click', async () => {
+      const pw1 = document.getElementById('pw1').value;
+      const pw2 = document.getElementById('pw2').value;
+      msg.textContent = ''; msg.className = 'msg';
+
+      if (pw1.length < 8) { msg.textContent = 'Password must be at least 8 characters.'; msg.className = 'msg err'; return; }
+      if (pw1 !== pw2) { msg.textContent = 'Passwords don\'t match.'; msg.className = 'msg err'; return; }
+
+      saveBtn.disabled = true;
+
+      const gate = await ensureAAL2();
+      if (!gate.ok) {
+        saveBtn.disabled = false;
+        msg.textContent = gate.msg;
+        msg.className = 'msg err';
+        return;
+      }
+
+      const { error } = await supa.auth.updateUser({ password: pw1 });
+      saveBtn.disabled = false;
+
+      if (error) {
+        msg.textContent = error.message || 'Could not update password — the link may have expired.';
+        msg.className = 'msg err';
+        return;
+      }
+      // Success — end the recovery session so the token can't linger in this tab.
+      await supa.auth.signOut();
+      formState.classList.add('hidden');
+      doneState.classList.remove('hidden');
+    });
+  </script>
+</body>
+</html>
